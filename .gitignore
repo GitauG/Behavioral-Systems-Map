@@ -1,4 +1,182 @@
-.Rproj.user
+# ====================
+# R Specific Files
+# ====================
+
+# RStudio files
+.Rproj.user/
+.Rproj.user.backup/
 .Rhistory
 .RData
 .Ruserdata
+.Rproj
+.Rproj.d/
+
+# R temporary files
+*.Rcheck/
+*.Rhistory
+*.RData
+*.Rds
+*.rds
+*.Rproj
+.RDataTmp
+.Rhistory
+
+# R package build files
+*.tar.gz
+*.Rcheck/
+src-i386/
+src-x64/
+
+# R environment file
+.Renviron
+.Renviron.*
+.Rprofile
+
+# ====================
+# R Markdown & Reports
+# ====================
+
+# Specific file that might confuse users
+SM KE MAP.Rmd
+
+# R Markdown intermediates
+*.knit.md
+*.utf8.md
+*.html
+*_files/
+figure/
+*.png
+*.jpg
+*.jpeg
+
+# ====================
+# Version Control & IDE
+# ====================
+
+# Git files
+*.orig
+*.rej
+.git/
+.gitignore
+.gitattributes
+
+# ====================
+# Operating System Files
+# ====================
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+desktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msm
+*.exe
+*.dll
+*.so
+*.dylib
+
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+*.swp
+*.swo
+*~
+Icon?
+.AppleDouble
+.LSOverride
+._*
+
+# Linux
+*~
+.directory
+*.swp
+*.swo
+.document.events
+.datalad
+
+# ====================
+# Data Files (Optional - Remove if you need to share data)
+# ====================
+
+# Raw data
+*.csv
+*.xlsx
+*.xls
+*.tsv
+*.txt
+*.db
+*.sqlite
+
+# Processed data
+*.feather
+*.parquet
+*.rds
+*.RData
+*.Rda
+
+# ====================
+# Output & Log Files
+# ====================
+
+# Logs
+*.log
+*.out
+*.err
+
+# Plots and images
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.pdf
+*.svg
+
+# Reports (unless you want to track them)
+*.html
+*.pdf
+*.docx
+Report_files/
+
+# ====================
+# Shiny Applications
+# ====================
+
+# Shiny cache
+rsconnect/
+shinyapps/
+shinyapps.log
+*.rsconnect/
+*.shiny/
+
+# ====================
+# Misc
+# ====================
+
+# Backup files
+*.bak
+*.backup
+*.old
+
+# Temporary files
+*.tmp
+*.temp
+*.cache
+
+# Hidden files
+.*.swp
+.*.swo
+*~
+
+# Allow data files for Posit Connect
+!data/
+'!data/' >> .gitignore.rds
