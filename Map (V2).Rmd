@@ -1,0 +1,1645 @@
+---
+title: "Behavioral Journey Map Analysis - Complete Decision Tool (V2)"
+author: "George Wanjiru"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    code_folding: show
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+```
+###Installing Core Libraries
+```{r}
+# Core libraries
+required_packages <- c(
+  "tidyverse", "visNetwork", "shiny", "shinyWidgets", "DT",
+  "igraph", "RColorBrewer", "scales", "shinythemes", "plotly",
+  "htmltools", "randomForest", "cluster", "readxl", "openxlsx"
+)
+
+installed <- rownames(installed.packages())
+missing_packages <- setdiff(required_packages, installed)
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages, dependencies = TRUE)
+}
+lapply(required_packages, library, character.only = TRUE)
+```
+###Loading Data 
+```{r}
+load_all_data <- function() {
+  cat("Please select the main mapping matrix CSV file...\n")
+  main_matrix <- read.csv(file.choose(), stringsAsFactors = FALSE)
+  # Let R auto-convert names with make.names
+  colnames(main_matrix) <- make.names(colnames(main_matrix))
+  main_matrix[is.na(main_matrix)] <- ""
+  main_matrix <- main_matrix %>% distinct()
+  
+  cat("Please select the glossary CSV file...\n")
+  glossary_raw <- read.csv(file.choose(), header = FALSE, stringsAsFactors = FALSE)
+  
+  cat("Please select the behavior network CSV file (press Cancel to skip)...\n")
+  behavior_network <- tryCatch({
+    read.csv(file.choose(), stringsAsFactors = FALSE)
+  }, error = function(e) {
+    message("No behavior network file selected.")
+    return(NULL)
+  })
+  
+  return(list(matrix = main_matrix, glossary_raw = glossary_raw, behavior_network = behavior_network))
+}
+
+data_loaded <- load_all_data()
+main_matrix <- data_loaded$matrix
+glossary_raw <- data_loaded$glossary_raw
+behavior_network_raw <- data_loaded$behavior_network
+
+cat("\n=== DATA LOADED ===\n")
+cat("Main matrix:", nrow(main_matrix), "rows,", ncol(main_matrix), "columns\n")
+cat("Column names:\n", paste(colnames(main_matrix), collapse = "\n  "), "\n")
+if(!is.null(behavior_network_raw)) {
+  cat("Behavior network:", nrow(behavior_network_raw), "rows loaded\n")
+}
+```
+
+###Set Column Names to Detect Dynamically
+```{r}
+# ============================================
+# DETECT ACTUAL COLUMN NAMES DYNAMICALLY
+# ============================================
+
+# Print all columns to help debug
+cat("\n=== ALL COLUMNS IN MAIN MATRIX ===\n")
+for(i in 1:ncol(main_matrix)) {
+  cat(sprintf("%2d: [%s]\n", i, colnames(main_matrix)[i]))
+}
+
+# Helper to find column by keyword
+find_col <- function(keywords) {
+  for(kw in keywords) {
+    matches <- grep(kw, colnames(main_matrix), ignore.case = TRUE, value = TRUE)
+    if(length(matches) > 0) return(matches[1])
+  }
+  return(NULL)
+}
+
+# Map ALL columns we need
+col_journey    <- find_col(c("Journey"))
+col_actor      <- find_col(c("Actor"))
+col_cause      <- find_col(c("Cause"))
+col_desc       <- find_col(c("Description", "Notes"))
+col_infl_notes <- find_col(c("Not in the map"))
+col_infl1      <- find_col(c("Influence.*Theme.*Level.1", "Influence Theme.*1"))
+col_infl2      <- find_col(c("Influence.*Theme.*Level.2", "Influence Theme.*2"))
+col_infl3      <- find_col(c("Influence.*Theme.*Level.3", "Influence Theme.*3"))
+col_eff1       <- find_col(c("Effect.*Theme.*Level.1", "Effect Theme.*1"))
+col_eff2       <- find_col(c("Effect.*Theme.*Level.2", "Effect Theme.*2"))
+col_eff_cat    <- find_col(c("Effect.*Category", "Behavior.*Influence"))
+col_eff_actor  <- find_col(c("Effect.*Actor"))
+col_count      <- find_col(c("Count"))
+col_effect_dir <- find_col(c("Effect of the influence", "Negative.*Positive.*Mixed"))
+col_comb       <- find_col(c("COM.B", "COM-B"))
+col_sem        <- find_col(c("SEM"))
+col_subsystem  <- find_col(c("Sub.system", "Sub-system"))
+
+# Print what we found
+cat("\n=== DETECTED COLUMN MAPPINGS ===\n")
+mappings <- list(
+  "Journey" = col_journey, "Actor" = col_actor, "Cause" = col_cause,
+  "Description" = col_desc, "L1 Influence" = col_infl1,
+  "L2 Influence Theme" = col_infl2, "L3 Influence" = col_infl3,
+  "L2 Behavior (Effect)" = col_eff2, "Effect Actor" = col_eff_actor,
+  "Count" = col_count, "Effect Direction" = col_effect_dir,
+  "COM-B" = col_comb, "SEM Level" = col_sem
+)
+for(name in names(mappings)) {
+  cat(sprintf("  %-25s = %s\n", paste0(name, ":"), 
+              ifelse(is.null(mappings[[name]]), "❌ NOT FOUND", mappings[[name]])))
+}
+
+# Check critical columns
+critical <- c("col_journey", "col_actor", "col_infl3", "col_eff2")
+missing_crit <- critical[sapply(critical, function(x) is.null(get(x)))]
+if(length(missing_crit) > 0) {
+  stop("CRITICAL: Cannot find columns: ", paste(missing_crit, collapse = ", "),
+       "\nCheck the column names printed above.")
+}
+```
+
+###Data Quality Checks and Cleaning
+```{r}
+# ============================================
+# DATA QUALITY CHECKS & CLEANING
+# ============================================
+
+# Clean actor names
+clean_actor_names <- function(actor_vec) {
+  actor_vec <- str_trim(actor_vec)
+  actor_vec <- gsub("\\s+", " ", actor_vec)
+  actor_vec <- case_when(
+    grepl("^Citizen", actor_vec, ignore.case = TRUE) ~ "Citizen",
+    grepl("^CSO|Civil Society", actor_vec, ignore.case = TRUE) ~ "CSO",
+    grepl("^Policy|Policymaker", actor_vec, ignore.case = TRUE) ~ "Policy maker",
+    grepl("^Local|Local Govt", actor_vec, ignore.case = TRUE) ~ "Local Govt official",
+    grepl("^Religious", actor_vec, ignore.case = TRUE) ~ "Religious leader",
+    grepl("^Media professional|Media professsional", actor_vec, ignore.case = TRUE) ~ "Media professional",
+    grepl("^Social media", actor_vec, ignore.case = TRUE) ~ "Social media",
+    grepl("^Government|^Govt", actor_vec, ignore.case = TRUE) ~ "Government Official",
+    grepl("^Women", actor_vec, ignore.case = TRUE) ~ "Women",
+    TRUE ~ actor_vec
+  )
+  return(actor_vec)
+}
+
+# Apply actor cleaning
+main_matrix[[col_actor]] <- clean_actor_names(main_matrix[[col_actor]])
+if(!is.null(col_eff_actor)) {
+  main_matrix[[col_eff_actor]] <- clean_actor_names(main_matrix[[col_eff_actor]])
+}
+
+cat("\n=== ACTORS CLEANED ===\n")
+all_actors <- unique(c(main_matrix[[col_actor]], main_matrix[[col_eff_actor]]))
+cat("Unique actors:", length(all_actors), "\n")
+cat(paste("  -", sort(all_actors), collapse = "\n"), "\n")
+
+# Check effect direction values
+cat("\n=== EFFECT DIRECTION VALUES ===\n")
+if(!is.null(col_effect_dir)) {
+  effect_raw <- main_matrix[[col_effect_dir]]
+  cat("Sample values:", paste(head(unique(effect_raw), 10), collapse = ", "), "\n")
+}
+
+# Create quality check export
+quality_check_table <- main_matrix %>%
+  select(
+    Journey = all_of(col_journey),
+    Actor = all_of(col_actor),
+    L3_Influence = all_of(col_infl3),
+    L2_Behavior = all_of(col_eff2),
+    Effect_Actor = all_of(col_eff_actor),
+    Effect_Direction = if(!is.null(col_effect_dir)) all_of(col_effect_dir) else all_of(col_journey),
+    Count = if(!is.null(col_count)) all_of(col_count) else all_of(col_journey),
+    COM_B = if(!is.null(col_comb)) all_of(col_comb) else all_of(col_journey)
+  ) %>%
+  distinct()
+
+# If we accidentally selected journey multiple times, fix
+if(!is.null(col_effect_dir) && !is.null(col_count) && !is.null(col_comb)) {
+  # Good, all columns exist
+} else {
+  # Fix the table for export
+  quality_check_table <- main_matrix %>%
+    select(
+      Journey = all_of(col_journey),
+      Actor = all_of(col_actor),
+      L3_Influence = all_of(col_infl3),
+      L2_Behavior = all_of(col_eff2)
+    ) %>%
+    distinct()
+}
+
+# Export
+output_dir <- getwd()
+quality_check_file <- file.path(output_dir, paste0("data_quality_check_", Sys.Date(), ".xlsx"))
+
+tryCatch({
+  write.xlsx(list(
+    "Unique_Pairings" = quality_check_table,
+    "Unique_Actors" = data.frame(Actor = sort(all_actors)),
+    "Column_Mapping" = data.frame(
+      Purpose = names(mappings),
+      Detected_Column = unlist(lapply(mappings, function(x) ifelse(is.null(x), "NOT FOUND", x)))
+    )
+  ), quality_check_file)
+  cat("\n✅ Quality check file saved:", quality_check_file, "\n")
+}, error = function(e) {
+  cat("\n⚠️ Could not save quality check file:", e$message, "\n")
+})
+```
+
+###Glossary Cleaning
+```{r}
+# ============================================
+# GLOSSARY CLEANING
+# ============================================
+
+# STEP 1: Promote first row to column names
+colnames(glossary_raw) <- as.character(unlist(glossary_raw[1, ]))
+
+# STEP 2: Remove the header row from the data
+glossary_clean <- glossary_raw[-1, ]
+
+# Remove columns whose header is NA or blank
+valid_cols <- !is.na(colnames(glossary_clean)) & trimws(colnames(glossary_clean)) != ""
+glossary_clean <- glossary_clean[, valid_cols]
+
+# STEP 3: Clean column names for safe R usage
+# STEP 3: Clean and make column names unique
+raw_names <- as.character(colnames(glossary_clean))
+raw_names[is.na(raw_names) | trimws(raw_names) == ""] <- "empty_col"
+colnames(glossary_clean) <- make.unique(make.names(raw_names))
+# Inspect names after cleaning
+print(colnames(glossary_clean))
+
+# STEP 4: Identify glossary term and definition columns
+find_col_glossary <- function(df, keywords) {
+  for (kw in keywords) {
+    matches <- grep(kw, colnames(df), ignore.case = TRUE, value = TRUE)
+    if (length(matches) > 0) return(matches[1])
+  }
+  stop(paste("Could not find column matching:", paste(keywords, collapse = ", ")))
+}
+
+name_col <- find_col_glossary(
+  glossary_clean,
+  c("Influence", "Behavior", "Name", "Term")
+)
+
+# Force Description column - look for exact match first
+def_col <- if("Description" %in% colnames(glossary_clean)) {
+  "Description"
+} else {
+  find_col_glossary(
+    glossary_clean,
+    c("Description", "Definition")
+  )
+}
+cat("Using definition column:", def_col, "\n")
+
+# STEP 5: Rename to standard internal names
+glossary_clean <- glossary_clean %>%
+  rename(
+    name = all_of(name_col),
+    definition = all_of(def_col)
+  ) %>%
+  filter(
+    !is.na(name),
+    name != "",
+    !grepl("^\\s*$", name)
+  ) %>%
+  distinct(name, .keep_all = TRUE)
+
+# Check result
+glimpse(glossary_clean)
+
+# DEBUG: Check how many definitions are non-empty
+cat("\n=== GLOSSARY DIAGNOSTIC ===\n")
+cat("Total rows:", nrow(glossary_clean), "\n")
+cat("Non-empty definitions:", sum(!is.na(glossary_clean$definition) & glossary_clean$definition != ""), "\n")
+cat("Empty definitions:", sum(is.na(glossary_clean$definition) | glossary_clean$definition == ""), "\n")
+cat("Sample names:", paste(head(glossary_clean$name, 10), collapse = ", "), "\n")
+cat("Sample definitions (first 3):\n")
+for(i in 1:min(3, nrow(glossary_clean))) {
+  cat(sprintf("  [%s]: %s\n", 
+      substr(glossary_clean$name[i], 1, 40),
+      substr(glossary_clean$definition[i], 1, 80)))
+}
+
+# L4 Categories to highlight
+l4_categories <- c(
+  "INFORMATION ACCESS AND QUALITY",
+  "TRUST AND CREDIBILITY",
+  "INSTITUTIONAL SYSTEMS",
+  "POWER, POLITICS AND INCENTIVES",
+  "CAPABILITY AND KNOWLEDGE",
+  "SOCIAL NORMS AND COLLECTIVE BEHAVIOR",
+  "PSYCHOLOGICAL AND EMOTIONAL DRIVERS"
+)
+
+glossary_clean <- glossary_clean %>%
+  mutate(
+    is_l4 = toupper(trimws(name)) %in% toupper(l4_categories),
+    level = ifelse(is_l4, "L4 System Level", "L3 Influence")
+  )
+
+cat("\n=== GLOSSARY CLEANED ===\n")
+cat("Terms:", nrow(glossary_clean), "\n")
+cat("L4 Categories found:", sum(glossary_clean$is_l4), "\n")
+cat("L4s:", paste(glossary_clean$name[glossary_clean$is_l4], collapse = ", "), "\n")
+```
+
+###Cleaning Main Data
+```{r}
+# ============================================
+# CLEAN AND PREPARE MAIN DATA
+# ============================================
+
+# Remove empty rows
+main_matrix <- main_matrix %>%
+  filter(.data[[col_infl3]] != "" | .data[[col_eff2]] != "")
+
+# Clean text
+char_cols <- sapply(main_matrix, is.character)
+for(cn in names(char_cols)[char_cols]) {
+  main_matrix[[cn]] <- str_trim(main_matrix[[cn]])
+  main_matrix[[cn]] <- gsub("\\s+", " ", main_matrix[[cn]])
+}
+
+# Convert count
+if(!is.null(col_count)) {
+  main_matrix$Count_numeric <- suppressWarnings(as.numeric(as.character(main_matrix[[col_count]])))
+  main_matrix$Count_numeric[is.na(main_matrix$Count_numeric)] <- 1
+} else {
+  main_matrix$Count_numeric <- 1
+}
+
+# Convert effect direction
+main_matrix$Effect_numeric <- 0
+if(!is.null(col_effect_dir)) {
+  raw_eff <- as.character(main_matrix[[col_effect_dir]])
+  main_matrix$Effect_numeric <- suppressWarnings(as.numeric(raw_eff))
+  main_matrix$Effect_numeric[is.na(main_matrix$Effect_numeric)] <- 0
+  
+  # CONVERT: 0 (Negative) → -1, 1 (Positive) → 1, 2 (Mixed) → 0
+  cat("\nConverting effect values:\n")
+  cat("  Before: 0=Negative, 1=Positive, 2=Mixed\n")
+  
+  main_matrix$Effect_numeric <- case_when(
+    main_matrix$Effect_numeric == 0 ~ -1,   # Negative → -1
+    main_matrix$Effect_numeric == 1 ~ 1,    # Positive → 1
+    main_matrix$Effect_numeric == 2 ~ 0,    # Mixed → 0
+    TRUE ~ main_matrix$Effect_numeric
+  )
+  
+  cat("  After: -1=Negative, 0=Mixed, 1=Positive\n")
+}
+cat("\n=== JOURNEY VALUES IN DATA ===\n")
+print(table(main_matrix[[col_journey]]))
+```
+###Building Nodes
+```{r}
+# ============================================
+# BUILD NODES - USING L2 AS PRIMARY INFLUENCES
+# ============================================
+# ============================================
+# VERIFY INFLUENCE VS BEHAVIOR CATEGORIES
+# ============================================
+cat("\n=== EFFECT CATEGORY CHECK ===\n")
+if(!is.null(col_eff_cat)) {
+  cat("Effect Category column:", col_eff_cat, "\n")
+  cat("Values:\n")
+  print(table(main_matrix[[col_eff_cat]], useNA = "ifany"))
+  
+  # Check which rows are influences vs behaviors based on this column
+  cat("\nSample rows where Effect Category = 'Influence':\n")
+  inf_rows <- main_matrix[grepl("Influence", main_matrix[[col_eff_cat]], ignore.case = TRUE), ]
+  cat("Count:", nrow(inf_rows), "\n")
+  if(nrow(inf_rows) > 0) {
+    cat("Sample L3 values:", paste(head(inf_rows[[col_infl3]], 3), collapse = ", "), "\n")
+  }
+  
+  cat("\nSample rows where Effect Category = 'Behavior':\n")
+  beh_rows <- main_matrix[grepl("Behavior", main_matrix[[col_eff_cat]], ignore.case = TRUE), ]
+  cat("Count:", nrow(beh_rows), "\n")
+  if(nrow(beh_rows) > 0) {
+    cat("Sample L2 values:", paste(head(beh_rows[[col_eff2]], 3), collapse = ", "), "\n")
+  }
+  
+  # Export this check
+  category_check <- data.frame(
+    Effect_Category = main_matrix[[col_eff_cat]],
+    L3_Influence = main_matrix[[col_infl3]],
+    L2_Behavior = main_matrix[[col_eff2]],
+    Journey = main_matrix[[col_journey]],
+    stringsAsFactors = FALSE
+  ) %>%
+    group_by(Effect_Category) %>%
+    summarise(
+      Count = n(),
+      Sample_Influences = paste(unique(head(L3_Influence, 3)), collapse = " | "),
+      Sample_Behaviors = paste(unique(head(L2_Behavior, 3)), collapse = " | "),
+      .groups = "drop"
+    )
+  
+  cat("\nCategory Summary:\n")
+  print(category_check)
+} else {
+  cat("WARNING: Effect Category column not found. Using all rows for both influences and behaviors.\n")
+}
+# First, check what column to use for influence vs behavior
+cat("\n=== CHECKING INFLUENCE/BEHAVIOR CATEGORIES ===\n")
+if(!is.null(col_eff_cat)) {
+  cat("Effect Category values:\n")
+  print(table(main_matrix[[col_eff_cat]]))
+}
+
+# L2 influences = main display influences
+# L3 influences = system level (used as filter)
+Actor_col <- main_matrix[[col_actor]]
+Effect_Actor_col <- if(!is.null(col_eff_actor)) main_matrix[[col_eff_actor]] else ""
+Journey_col <- main_matrix[[col_journey]]
+COM_B_col <- if(!is.null(col_comb)) main_matrix[[col_comb]] else ""
+SEM_col <- if(!is.null(col_sem)) main_matrix[[col_sem]] else ""
+Desc_col <- if(!is.null(col_desc)) main_matrix[[col_desc]] else ""
+
+# Use L2 as primary influence nodes (more granular)
+nodes <- data.frame(
+  name = c(main_matrix[[col_infl2]], main_matrix[[col_eff2]]),
+  description = c(Desc_col, Desc_col),
+  actor = c(Actor_col, Effect_Actor_col),
+  comb = c(COM_B_col, COM_B_col),
+  journey = c(Journey_col, Journey_col),
+  l3_category = c(main_matrix[[col_infl3]], rep("", nrow(main_matrix))),  # L3 as filter
+  sem_level = c(SEM_col, SEM_col),
+  level = c(rep("L2 Influence", nrow(main_matrix)), rep("Behavior", nrow(main_matrix))),
+  type = c(rep("Influence", nrow(main_matrix)), rep("Behavior", nrow(main_matrix))),
+  stringsAsFactors = FALSE
+) %>%
+  filter(name != "", !is.na(name)) %>%
+  distinct(name, type, .keep_all = TRUE)
+
+cat("\nNodes before deduplication:", nrow(nodes), "\n")
+
+# Calculate metrics
+counts <- bind_rows(
+  main_matrix %>%
+    filter(.data[[col_infl2]] != "") %>%
+    group_by(name = .data[[col_infl2]]) %>%
+    summarise(mentions = sum(Count_numeric, na.rm = TRUE),
+              avg_effect = mean(Effect_numeric, na.rm = TRUE), .groups = "drop"),
+  main_matrix %>%
+    filter(.data[[col_eff2]] != "") %>%
+    group_by(name = .data[[col_eff2]]) %>%
+    summarise(mentions = n(),
+              avg_effect = mean(Effect_numeric, na.rm = TRUE), .groups = "drop")
+) %>%
+  group_by(name) %>%
+  summarise(mentions = sum(mentions), avg_effect = mean(avg_effect), .groups = "drop")
+
+nodes <- nodes %>%
+  left_join(counts, by = "name") %>%
+  mutate(
+    mentions = ifelse(is.na(mentions), 1, mentions),
+    avg_effect = ifelse(is.na(avg_effect), 0, avg_effect)
+  )
+
+# Add glossary
+n# Check which nodes match glossary
+cat("\n=== GLOSSARY MATCHING ===\n")
+cat("Nodes before join:", nrow(nodes), "\n")
+
+nodes <- nodes %>%
+  left_join(
+    glossary_clean %>% select(name, definition, is_l4),
+    by = "name"
+  )
+
+cat("Matched definitions:", sum(!is.na(nodes$Description)), "/", nrow(nodes), "\n")
+cat("Unmatched nodes:", sum(is.na(nodes$Description)), "\n")
+if(sum(is.na(nodes$Description)) > 0) {
+  cat("Sample unmatched:\n")
+  unmatched <- nodes %>% filter(is.na(Description)) %>% pull(name) %>% unique() %>% head(10)
+  cat(paste("  -", unmatched, collapse = "\n"), "\n")
+}
+
+nodes <- nodes %>%
+  mutate(
+    Description = case_when(
+      !is.na(definition) & definition != "" ~ definition,
+      !is.na(description) & description != "" ~ substr(description, 1, 200),
+      TRUE ~ name
+    ),
+    is_l4 = ifelse(is.na(is_l4), FALSE, is_l4)
+  )
+
+cat("Final Description coverage:", sum(nodes$Description != nodes$name & nodes$Description != ""), "/", nrow(nodes), "\n")
+
+nodes$id <- 1:nrow(nodes)
+nodes$effect_type <- case_when(
+  nodes$avg_effect > 0.3 ~ "Lever (Positive)",
+  nodes$avg_effect < -0.3 ~ "Barrier (Negative)",
+  TRUE ~ "Both/Mixed"
+)
+
+# Simple colors
+nodes$color.background <- ifelse(nodes$type == "Influence", "#3498db", "#9b59b6")
+nodes$color.border <- "#333333"
+nodes$borderWidth <- 1
+# Only highlighted gaps get red border, otherwise kept subtle
+nodes$size <- scales::rescale(log(nodes$mentions + 1), to = c(15, 35))
+nodes$shape <- ifelse(nodes$type == "Influence", "dot", "diamond")
+nodes$font.size <- 14
+nodes$font.color <- "#2C3E50"
+nodes$shadow <- TRUE
+
+cat("\nNodes built:", nrow(nodes), "\n")
+
+# ============================================
+# BUILD EDGES
+# ============================================
+
+edges <- main_matrix %>%
+  filter(.data[[col_infl2]] != "", .data[[col_eff2]] != "") %>%
+  transmute(
+    from_name = .data[[col_infl2]],    
+    to_name = .data[[col_eff2]],
+    direction = Effect_numeric,
+    weight = Count_numeric,
+    actor_from = .data[[col_actor]],
+    actor_to = if(!is.null(col_eff_actor)) .data[[col_eff_actor]] else "",
+    journey = .data[[col_journey]]
+  ) %>%
+  group_by(from_name, to_name) %>%
+  summarise(
+    direction = mean(direction, na.rm = TRUE),
+    weight = sum(weight, na.rm = TRUE),
+    actor_from = first(actor_from),
+    actor_to = first(actor_to),
+    journey = first(journey),
+    .groups = "drop"
+  ) %>%
+  mutate(weight = ifelse(is.na(weight) | weight == 0, 1, weight))
+
+# Map to IDs
+edges <- edges %>%
+  left_join(nodes %>% select(id, name), by = c("from_name" = "name")) %>%
+  rename(from = id) %>%
+  left_join(nodes %>% select(id, name), by = c("to_name" = "name")) %>%
+  rename(to = id) %>%
+  filter(!is.na(from), !is.na(to))
+
+# Map to IDs
+# Check what columns we have before mapping
+cat("\n=== EDGE MAPPING DEBUG ===\n")
+cat("Edges columns before mapping:", paste(colnames(edges), collapse = ", "), "\n")
+cat("Sample from_names:", paste(head(edges$from_name, 5), collapse = ", "), "\n")
+cat("Sample to_names:", paste(head(edges$to_name, 5), collapse = ", "), "\n")
+
+# Simple approach: map names to IDs manually
+# Create lookup table from nodes
+node_lookup <- nodes %>% select(id, name)
+cat("Node lookup rows:", nrow(node_lookup), "\n")
+
+# Map from_name to from ID
+edges$from <- node_lookup$id[match(edges$from_name, node_lookup$name)]
+edges$to <- node_lookup$id[match(edges$to_name, node_lookup$name)]
+
+cat("Edges with from/to IDs:\n")
+cat("  from IDs - NA count:", sum(is.na(edges$from)), "\n")
+cat("  to IDs - NA count:", sum(is.na(edges$to)), "\n")
+
+# Filter to only valid edges
+edges <- edges %>%
+  filter(!is.na(from), !is.na(to))
+
+cat("  Valid edges after filtering:", nrow(edges), "\n")
+
+# Remove the name columns (keep IDs)
+edges <- edges %>%
+  select(from, to, direction, weight, actor_from, actor_to, journey)
+
+# ADD THESE DEBUG LINES:
+cat("\n=== EDGE MATCHING DIAGNOSTIC ===\n")
+cat("Total edges before ID mapping:", nrow(main_matrix %>% filter(.data[[col_infl2]] != "", .data[[col_eff2]] != "")), "\n")
+cat("Edges after ID mapping:", nrow(edges), "\n")
+cat("Edges lost (no node match):", 
+    nrow(main_matrix %>% filter(.data[[col_infl2]] != "", .data[[col_eff2]] != "")) - nrow(edges), "\n")
+
+if(nrow(edges) == 0) {
+  cat("\n⚠️ NO EDGES MATCHED! Checking name alignment...\n")
+  cat("Sample edge from_names:\n")
+  print(head(unique(main_matrix[[col_infl2]][main_matrix[[col_infl2]] != ""]), 10))
+  cat("\nSample node names:\n")
+  print(head(nodes$name[nodes$type == "Influence"], 10))
+}
+
+# Arrow colors
+# Edge colors based on converted values
+cat("\n=== EDGE DIRECTION DISTRIBUTION ===\n")
+cat("Negative (-1):", sum(edges$direction < 0), "\n")
+cat("Neutral (0):", sum(edges$direction == 0), "\n")
+cat("Positive (1):", sum(edges$direction > 0), "\n")
+
+edges$color <- case_when(
+  edges$direction > 0 ~ "#2ecc71",   # Green for positive
+  edges$direction < 0 ~ "#e74c3c",   # Red for negative
+  TRUE ~ "#f39c12"                    # Orange for neutral/mixed
+)
+
+cat("Edge colors assigned:", paste(names(table(edges$color)), collapse = ", "), "\n")
+
+edges$width <- scales::rescale(log(edges$weight + 1), to = c(1, 5))
+edges$arrows <- "to"
+edges$smooth <- TRUE
+
+# Ensure arrows are always enabled
+edges$arrows <- list(
+  to = list(enabled = TRUE, scaleFactor = 1)
+)
+
+# Print edge summary for debugging
+cat("\n=== EDGES BUILT ===\n")
+cat("Total edges:", nrow(edges), "\n")
+cat("Edge columns:", paste(colnames(edges), collapse = ", "), "\n")
+cat("Color distribution:\n")
+print(table(edges$color))
+
+edges$title <- paste0(
+  "<b>", edges$actor_from, " → ", edges$actor_to, "</b><br>",
+  "Effect: ", round(edges$direction, 2), "<br>",
+  "Weight: ", edges$weight
+)
+
+cat("Edges built:", nrow(edges), "\n")
+cat("Edge colors:", paste(names(table(edges$color)), collapse = ", "), "\n")
+```
+###Wrapping Glossary Definitions and creating tooltips
+```{r}
+wrap_text <- function(text, width = 50) {
+  if (is.na(text) || is.null(text) || text == "") return("No description available")
+  words <- strsplit(as.character(text), " ")[[1]]
+  lines <- character()
+  current_line <- ""
+  for (word in words) {
+    if (nchar(paste(current_line, word)) <= width) {
+      current_line <- if (current_line == "") word else paste(current_line, word)
+    } else {
+      lines <- c(lines, current_line)
+      current_line <- word
+    }
+  }
+  lines <- c(lines, current_line)
+  paste(lines, collapse = "<br>")
+}
+
+create_tooltips <- function(nodes) {
+  tooltips <- character(nrow(nodes))
+  for(i in 1:nrow(nodes)) {
+    eff_badge <- case_when(
+      nodes$effect_type[i] == "Lever (Positive)" ~ 
+        '<span style="background:#2ecc71;color:white;padding:2px 8px;border-radius:10px;">Lever</span>',
+      nodes$effect_type[i] == "Barrier (Negative)" ~ 
+        '<span style="background:#e74c3c;color:white;padding:2px 8px;border-radius:10px;">Barrier</span>',
+      TRUE ~ '<span style="background:#f39c12;color:white;padding:2px 8px;border-radius:10px;">Mixed</span>'
+    )
+    
+    if(nodes$type[i] == "Influence") {
+      tooltips[i] <- paste0(
+        "<div style='max-width:400px;padding:12px;font-family:Arial;'>",
+        "<h4 style='color:#2C3E50;'>", htmlEscape(nodes$name[i]), " ", eff_badge, "</h4>",
+        "<div style='background:#f8f9fa;padding:8px;border-radius:5px;margin:8px 0;'>",
+        "<b>Definition:</b><br>", wrap_text(nodes$Description[i], 60),
+        "</div>",
+        "<table style='font-size:0.85em;'>",
+        "<tr><td><b>Actor:</b></td><td>", htmlEscape(nodes$actor[i]), "</td></tr>",
+        "<tr><td><b>Journey:</b></td><td>", htmlEscape(nodes$journey[i]), "</td></tr>",
+        "<tr><td><b>COM-B:</b></td><td>", htmlEscape(nodes$comb[i]), "</td></tr>",
+        "<tr><td><b>Mentions:</b></td><td>", nodes$mentions[i], "</td></tr>",
+        "<tr><td><b>Avg Effect:</b></td><td>", round(nodes$avg_effect[i], 2), 
+        " <span style='font-size:0.8em;color:#666;'>(+ = enables, - = blocks)</span></td></tr>",
+        "</table></div>"
+      )
+    } else {
+      tooltips[i] <- paste0(
+        "<div style='max-width:400px;padding:12px;font-family:Arial;'>",
+        "<h4 style='color:#8e44ad;'>", htmlEscape(nodes$name[i]), " (Behavior)</h4>",
+        "<div style='background:#f8f9fa;padding:8px;border-radius:5px;'>",
+        wrap_text(nodes$Description[i], 60),
+        "</div>",
+        "<table style='font-size:0.85em;'>",
+        "<tr><td><b>Actor:</b></td><td>", htmlEscape(nodes$actor[i]), "</td></tr>",
+        "<tr><td><b>Journey:</b></td><td>", htmlEscape(nodes$journey[i]), "</td></tr>",
+        "<tr><td><b>Mentions:</b></td><td>", nodes$mentions[i], "</td></tr>",
+        "</table></div>"
+      )
+    }
+  }
+  return(tooltips)
+}
+
+nodes$title <- create_tooltips(nodes)
+```
+
+###Identifying gaps that exist in our nodes and edges to guide intervention points
+```{r}
+# Identify gaps
+identify_gaps <- function(nodes_data, edges_data) {
+  if(nrow(edges_data) == 0) return(NULL)
+  edge_counts <- c(table(edges_data$from), table(edges_data$to))
+  node_degrees <- data.frame(
+    id = as.numeric(names(edge_counts)),
+    degree = as.numeric(edge_counts)
+  ) %>% group_by(id) %>% summarise(degree = sum(degree), .groups = "drop")
+  
+  nodes_data %>%
+    left_join(node_degrees, by = "id") %>%
+    mutate(
+      degree = ifelse(is.na(degree), 0, degree),
+      gap_score = mentions / (degree + 1),
+      is_gap = gap_score > quantile(gap_score, 0.8, na.rm = TRUE)
+    )
+}
+
+gap_nodes <- identify_gaps(nodes, edges)
+if(!is.null(gap_nodes)) {
+  nodes$is_gap <- gap_nodes$is_gap
+  cat("\nGaps identified:", sum(nodes$is_gap, na.rm = TRUE), "\n")
+}
+```
+
+###Adding suggestions from analysis to make map more prescriptive than descriptive and guide ML suggestions later
+```{r}
+# ============================================
+# STAKEHOLDER SUGGESTIONS DATABASE
+# ============================================
+
+suggestions_db <- list(
+  
+  # RECEIVE INFORMATION
+  "Receive Information" = list(
+    title = "Improving How Citizens Receive Information",
+    cross_cutting = "Citizens frame trust reform as both a regulatory problem (misinformation control) and a structural communication problem (weak official channels and civic literacy gaps).",
+    
+    by_stakeholder = list(
+      Citizen = list(
+        icon = "👤",
+        suggestions = c(
+          "Stricter regulation of misinformation - enforce cybercrime laws, penalize false information",
+          "Official government communication through verified channels and official handles",
+          "Increased civic education and sensitization - educate youth, take engagement to village level",
+          "Timely and transparent communication - announce participation early, avoid politicization",
+          "Decentralized multi-channel communication - use barazas, radio, social media, print"
+        )
+      ),
+      CSO = list(
+        icon = "🏗️",
+        suggestions = c(
+          "Collaboration across organizations for coordinated messaging",
+          "Government should accept citizen voices and create clear trickle-down communication",
+          "Professionalization of information handling",
+          "Better training of ward administrators"
+        ),
+        emphasis = "Institutional reform + coordination rather than punishment"
+      ),
+      `Policy maker` = list(
+        icon = "🏛️",
+        suggestions = c(
+          "Formal online platforms (Twitter spaces, official pages)",
+          "Structured dissemination through press conferences and webinars",
+          "Controlled communication flows to manage agitation and digital pressure"
+        ),
+        emphasis = "Formalized, top-down systems with recognition of anger triggers"
+      ),
+      `Local Govt official` = list(
+        icon = "🏘️",
+        suggestions = c(
+          "Legalize misinformation control mechanisms",
+          "Bring engagement closer to village level",
+          "Improve procedural adherence and feedback loops"
+        ),
+        emphasis = "Administrative reform + decentralization"
+      ),
+      `Religious leader` = list(
+        icon = "⛪",
+        suggestions = c(
+          "Information should come from official organs",
+          "Government offices should communicate directly",
+          "Extend awareness beyond religious institutions",
+          "Face-to-face government-community interface"
+        ),
+        emphasis = "Authority-linked verification + moral responsibility"
+      ),
+      `Media professional` = list(
+        icon = "📰",
+        suggestions = c(
+          "Verification before publication",
+          "Professional filtering of information",
+          "Highlight issues repeatedly to force response",
+          "Fact-check before amplifying"
+        ),
+        emphasis = "Professional gatekeeping"
+      ),
+      `Social media` = list(
+        icon = "📱",
+        suggestions = c(
+          "Reporting and advocacy increases responsiveness",
+          "Trending issues trigger action",
+          "Repetition and visibility matter"
+        ),
+        emphasis = "Visibility power"
+      )
+    ),
+    
+    structural_models = c(
+      "1. Digital Regulation Model → Legal enforcement to restore trust",
+      "2. Official Channel Strengthening → Verified, centralized information sources",
+      "3. Civic Literacy Model → Empower citizens through education",
+      "4. Decentralization Model → Take communication to ward/village level",
+      "5. Transparency & Timeliness → Improve clarity and feedback loops"
+    ),
+    
+    demographic_note = "Youth rely more on digital platforms; older citizens prefer official channels; rural areas emphasize radio and village-level communication; urban areas emphasize online visibility."
+  ),
+  
+  # SHARING INFORMATION
+  "Sharing Information" = list(
+    title = "Improving How Information Is Shared",
+    cross_cutting = "Sharing information is where civic engagement either scales up or breaks down. Three dynamics: Independence + Trust Infrastructure, Reach + Inclusion Architecture, Capacity + Resourcing.",
+    
+    by_stakeholder = list(
+      Citizen = list(
+        icon = "👤",
+        suggestions = c(
+          "Timely, accurate, verified sharing - avoid 'first to share' culture",
+          "Local structures for sharing through chiefs, elders, Nyumba-Kumi, barazas",
+          "Create/strengthen community group platforms (especially WhatsApp)",
+          "Government should communicate directly and publicly",
+          "Civic education to enable citizens to share and act correctly"
+        )
+      ),
+      CSO = list(
+        icon = "🏗️",
+        suggestions = c(
+          "Ground-truthing before amplifying - verify by visiting sites",
+          "Use structured dissemination tools (newsletters, submissions, forums)",
+          "Resource mobilization for dissemination - funds for media and ground reach",
+          "Demand transparency and accountability to enable advocacy"
+        ),
+        emphasis = "Verification + packaging + resourcing"
+      ),
+      `Policy maker` = list(
+        icon = "🏛️",
+        suggestions = c(
+          "Mobilization through local political brokers",
+          "Human-rights based framing for service delivery communication"
+        ),
+        emphasis = "Pragmatic mobilization tension: turnout vs trust"
+      ),
+      `Local Govt official` = list(
+        icon = "🏘️",
+        suggestions = c(
+          "Use trusted grassroots relays: Nyumba-Kumi and elders",
+          "Institutionalize public health/school-based dissemination",
+          "Train local administrators to relay information properly"
+        ),
+        emphasis = "Channel efficiency + institutional nodes"
+      ),
+      `Religious leader` = list(
+        icon = "⛪",
+        suggestions = c(
+          "Train communities on rights so they can speak and share confidently",
+          "Capacity and resources needed to disseminate",
+          "Local representation in leadership improves credibility and reach"
+        ),
+        emphasis = "Civic literacy + legitimacy"
+      ),
+      `Media professional` = list(
+        icon = "📰",
+        suggestions = c(
+          "Media independence and neutrality - reduce political capture",
+          "Timely civic reporting linked to decision windows",
+          "Improve packaging for accessibility (language, simplicity)",
+          "Resources and training for journalists",
+          "Increase interaction time and community voice in programming"
+        ),
+        emphasis = "Free, resourced, trained, and interactive media"
+      ),
+      `Social media` = list(
+        icon = "📱",
+        suggestions = c(
+          "Training and structured platforms for meaningful reporting",
+          "Security/protection and clear policy to prevent intimidation",
+          "Government should fund/program civic information content"
+        ),
+        emphasis = "Opportunity + risk: skills, protection, planned content needed"
+      )
+    )
+  ),
+  
+  # TAKE ACTION
+  "Take Action" = list(
+    title = "Enabling Citizens to Take Action",
+    cross_cutting = "Taking action depends on: lowering cost/friction, converting participation into visible results, and enabling action through capability and authority.",
+    
+    by_stakeholder = list(
+      Citizen = list(
+        icon = "👤",
+        suggestions = c(
+          "Civic education and awareness as the 'spark' for action",
+          "Regular, well-designed community meetings with key decision actors",
+          "Reduce the 'cost of participation' through transport support and better timing",
+          "Fast, visible government response sustains future action",
+          "Clear reporting channels and direct contacts for urgent issues",
+          "Trust and safety conditions to act without fear or judgment"
+        )
+      ),
+      CSO = list(
+        icon = "🏗️",
+        suggestions = c(
+          "Funding and resourcing to move from concern to action",
+          "Stronger government service delivery and 'open door' posture",
+          "Legal/institutional enabling environment (PBO Act)",
+          "Collective action among CSOs - reduce competition, increase coordination",
+          "Capacity building: legal minds, documentation skills, exchange learning",
+          "Local resource mobilization as sustainability pathway"
+        ),
+        emphasis = "Capacity + enabling environment"
+      ),
+      `Policy maker` = list(
+        icon = "🏛️",
+        suggestions = c(
+          "National mandate and oversight for regional dialogues",
+          "Accountability and transparency frameworks",
+          "Peer learning among government officials from neighboring wards"
+        )
+      ),
+      `Local Govt official` = list(
+        icon = "🏘️",
+        suggestions = c(
+          "Equip and resource local administrators (vehicles, operational budgets)",
+          "Clarify authority and command structures for enforcement",
+          "Push resources and decision-making closer to lowest level",
+          "Improve government-to-community communication and integrity",
+          "Administrative redesign to bring services closer"
+        ),
+        emphasis = "Operations: tools + budget + clear authority + anti-corruption + proximity"
+      ),
+      `Religious leader` = list(
+        icon = "⛪",
+        suggestions = c(
+          "Collective responsibility and cooperation for faster solutions",
+          "Improve devolution/service decentralization",
+          "Civic literacy: help communities make viable demands",
+          "Priority-setting by government based on local needs",
+          "Action through community participation in solutions (co-production)"
+        ),
+        emphasis = "Shared responsibility + civic maturity"
+      ),
+      `Media professional` = list(
+        icon = "📰",
+        suggestions = c(
+          "Media independence as the condition for civic action support",
+          "Availability and responsiveness of media as a bridge to action",
+          "More interactive programming that converts concern into participation",
+          "Training and linkages so reporters can support action effectively"
+        ),
+        emphasis = "Access + independence + interactivity"
+      ),
+      `Social media` = list(
+        icon = "📱",
+        suggestions = c(
+          "Independence and transparency about editorial decisions",
+          "Reliable access to media actors for rapid action coordination",
+          "Government advance notice enables 'action-ready' participation"
+        ),
+        emphasis = "Speed + clarity + credibility"
+      )
+    )
+  ),
+  
+  # RESPOND TO CIVIC ACTION
+  "Respond to Civic Action" = list(
+    title = "Improving Government Response to Civic Action",
+    cross_cutting = "Response hinges on four drivers: Speed (timely action), Completion (visible delivery), Transparency (corruption-free processes), and Proximity & Feedback (accessible institutions).",
+    
+    by_stakeholder = list(
+      Citizen = list(
+        icon = "👤",
+        suggestions = c(
+          "Timely and immediate government response as the primary expectation",
+          "Visible completion of agreed projects and services",
+          "Listening leadership with community involvement in decision-making",
+          "Transparency and anti-corruption enforcement",
+          "Clear and accessible feedback mechanisms with structured timelines",
+          "Proximity of services through genuine devolution",
+          "Leadership integrity and accountability"
+        )
+      ),
+      CSO = list(
+        icon = "🏗️",
+        suggestions = c(
+          "Move from policy on paper to implementation in practice",
+          "Strengthened feedback and escalation mechanisms",
+          "Trust-building through integrity and role clarity",
+          "Coordination structures across CSOs",
+          "Transparency in public resource allocation"
+        ),
+        emphasis = "Implementation + coordination challenge"
+      ),
+      `Policy maker` = list(
+        icon = "🏛️",
+        suggestions = c(
+          "Higher resource allocation at regional and county level",
+          "Continuous feedback mechanisms (policies, guidelines, SOPs)",
+          "Prioritize realistic, completable commitments",
+          "Include implementers in policy formulation",
+          "Strengthen constitutional implementation and transparency"
+        ),
+        emphasis = "Governance design + capacity: realistic planning, fiscal alignment"
+      ),
+      `Local Govt official` = list(
+        icon = "🏘️",
+        suggestions = c(
+          "Operational capacity: transport, equipment, and mobility",
+          "Training and knowledge strengthening for administrators",
+          "Funding release and administrative empowerment",
+          "Clear jurisdiction and escalation structures"
+        ),
+        emphasis = "Last-mile administrative constraints"
+      ),
+      `Religious leader` = list(
+        icon = "⛪",
+        suggestions = c(
+          "Integrate communities in policy-making processes",
+          "Raise community participation levels",
+          "Respect and implement constitutional provisions"
+        ),
+        emphasis = "Shared governance responsibility"
+      ),
+      `Media professional` = list(
+        icon = "📰",
+        suggestions = c(
+          "Sustained follow-up journalism for accountability",
+          "Media independence and protection from political interference",
+          "Accessible and responsive journalism",
+          "Improved regulatory environment for emerging media houses"
+        ),
+        emphasis = "Accountability monitoring function"
+      ),
+      `Social media` = list(
+        icon = "📱",
+        suggestions = c(
+          "Freedom of digital expression within safety limits",
+          "Expand digital access (e.g., free Wi-Fi)",
+          "Reach wider audiences to amplify accountability pressure"
+        ),
+        emphasis = "Visibility + amplification challenge"
+      )
+    )
+  )
+)
+
+# Key insight summary for quick reference
+key_insight <- "Civic engagement is not blocked by apathy—it is constrained by information system weaknesses, capacity gaps, and broken feedback loops. Across all journeys, stakeholders demand: verified information, accessible channels, responsive institutions, and genuine inclusion."
+```
+
+###UI Definition
+```{r}
+# ============================================
+# UI
+# ============================================
+ui <- fluidPage(
+  theme = shinytheme("flatly"),
+  
+  tags$head(tags$style(HTML("
+    .control-panel { background:#f8f9fa; border-radius:10px; padding:15px; margin-bottom:20px; box-shadow:0 2px 4px rgba(0,0,0,0.1); }
+    .stats-card { background:linear-gradient(135deg,#667eea,#764ba2); color:white; border-radius:10px; padding:15px; margin-bottom:15px; text-align:center; }
+    .insight-box { background:#f0f8ff; border-left:4px solid #3498db; padding:15px; margin:10px 0; font-family:monospace; white-space:pre-wrap; border-radius:5px; }
+    .map-legend { background:white; border:1px solid #ddd; border-radius:8px; padding:12px; margin-top:15px; }
+    .legend-item { display:inline-block; margin-right:15px; font-size:12px; }
+    .legend-color { display:inline-block; width:12px; height:12px; border-radius:50%; margin-right:5px; }
+    .suggestion-card { background:white; border-radius:8px; padding:12px; margin-bottom:10px; box-shadow:0 1px 3px rgba(0,0,0,0.1); }
+    .emphasis-box { background:#fef9e7; border-left:4px solid #f39c12; padding:8px 12px; margin-top:8px; border-radius:4px; font-size:0.9em; }
+  "))),
+  
+  titlePanel(
+    div(
+      h1("🧠 Behavioral Systems Map", style="display:inline-block;margin-right:15px;"),
+      span("CSO Decision Support Tool", style="color:#6c757d;font-size:18px;")
+    )
+  ),
+  
+  tabsetPanel(
+    id = "journey_tabs",
+    tabPanel("📥 Receive Information", value = "Receive Information"),
+    tabPanel("📤 Share Information", value = "Sharing Information"),
+    tabPanel("🎯 Take Action", value = "Take Action"),
+    tabPanel("🔄 Respond to Civic Action", value = "Respond to Civic Action"),
+    tabPanel("🌐 Full Map", value = "All"),
+    tabPanel("💡 Suggestions", value = "suggestions"),
+    tabPanel("📖 About COM-B", value = "comb_info")
+  ),
+  
+  br(),
+  
+  sidebarLayout(
+    sidebarPanel(width = 3,
+      div(class = "control-panel",
+        h4("🎛️ Controls"),
+        selectInput("stakeholder", "👥 I am a...",
+          choices = c("Civil Society (CSO)"="CSO","Policy Maker"="Policy Maker",
+                     "Media"="Media","Local Leader"="Local Leader")),
+        hr(),
+        h5("🎯 Filters"),
+        selectInput("actor", "👤 Actor", choices = c("All", sort(unique(nodes$actor)))),
+        selectInput("effect_filter", "📊 Effect Type",
+          choices = c("All","Lever (Positive)","Barrier (Negative)","Both/Mixed")),
+        selectInput("l3_filter", "📂 System Level (L3)",
+  choices = c("All", sort(unique(nodes$l3_category[nodes$l3_category != ""])))),
+        checkboxInput("show_gaps", "🔴 Highlight Gaps", FALSE),
+        hr(),
+        textInput("search", "🔍 Search", placeholder = "Type to search..."),
+        hr(),
+        # Layout fixed to network view (removed journey steps option temporarily)
+        checkboxInput("show_labels", "🏷️ Show Labels", TRUE),
+        hr(),
+        actionButton("run_ml", "🤖 Generate Insights", class="btn-primary", style="width:100%;"),
+        br(), br(),
+        downloadButton("download_data", "📥 Download Data", class="btn-info", style="width:100%;")
+      )
+    ),
+    
+    mainPanel(width = 9,
+      
+      # Network Map View
+      conditionalPanel("input.journey_tabs == 'Receive Information' || input.journey_tabs == 'Sharing Information' || input.journey_tabs == 'Take Action' || input.journey_tabs == 'Respond to Civic Action' || input.journey_tabs == 'All'",
+        visNetworkOutput("network", height = "550px"),
+        div(class = "map-legend",
+          fluidRow(
+            column(4,
+              h5("🔵 Nodes"),
+              p(span(style="color:#3498db;font-size:18px;","●")," L3 Influence"),
+              p(span(style="color:#9b59b6;font-size:18px;","◆")," L2 Behavior"),
+              p(span(style="border:3px solid red;padding:2px 8px;border-radius:12px;","⬤")," Gap (high potential)")
+            ),
+            column(4,
+              h5("➡️ Arrows"),
+              p(span(style="color:#2ecc71;font-size:18px;","→")," Positive/Lever"),
+              p(span(style="color:#e74c3c;font-size:18px;","→")," Negative/Barrier"),
+              p(span(style="color:#f39c12;font-size:18px;","→")," Mixed/Neutral")
+            ),
+            column(4,
+              h5("📏 Size = Mentions"),
+              p("Larger = More frequent in data")
+            )
+          )
+        )
+      ),
+      
+      # COM-B Info View
+      conditionalPanel("input.journey_tabs == 'comb_info'",
+  div(style = "max-width:700px; margin:0 auto; padding:20px;",
+    div(class = "insight-box",
+      h3("📖 What is COM-B?", style = "margin-top:0; font-size:20px;"),
+      p("COM-B is a behavioral science framework that helps understand what drives behavior.", 
+        style = "font-size:13px; line-height:1.5;"),
+      
+      fluidRow(
+        column(4,
+          div(style = "background:#d5f5e3; padding:10px; border-radius:8px; margin-bottom:10px;",
+            h4("C", style = "margin:0; color:#27ae60; font-size:16px;"),
+            p(strong("Capability"), style = "margin:2px 0; font-size:12px;"),
+            p("Knowledge, skills, ability to perform the behavior", style = "font-size:11px; color:#555;")
+          )
+        ),
+        column(4,
+          div(style = "background:#d6eaf8; padding:10px; border-radius:8px; margin-bottom:10px;",
+            h4("O", style = "margin:0; color:#2980b9; font-size:16px;"),
+            p(strong("Opportunity"), style = "margin:2px 0; font-size:12px;"),
+            p("Physical and social environment that enables the behavior", style = "font-size:11px; color:#555;")
+          )
+        ),
+        column(4,
+          div(style = "background:#fdebd0; padding:10px; border-radius:8px; margin-bottom:10px;",
+            h4("M", style = "margin:0; color:#e67e22; font-size:16px;"),
+            p(strong("Motivation"), style = "margin:2px 0; font-size:12px;"),
+            p("Automatic (emotions/habits) and Reflective (beliefs/intentions)", style = "font-size:11px; color:#555;")
+          )
+        )
+      ),
+      
+      hr(style = "margin:10px 0;"),
+      
+      h4("Why We Use COM-B in This Map", style = "font-size:14px;"),
+      p("Each influence is tagged with its COM-B component. This helps you identify:", style = "font-size:12px;"),
+      tags$ul(style = "font-size:12px;",
+        tags$li(strong("Physical Opportunity:"), " Access, infrastructure, resources"),
+        tags$li(strong("Social Opportunity:"), " Norms, networks, relationships"),
+        tags$li(strong("Psychological Capability:"), " Knowledge, skills, understanding"),
+        tags$li(strong("Automatic Motivation:"), " Habits, emotions, impulses"),
+        tags$li(strong("Reflective Motivation:"), " Beliefs, values, intentions")
+      ),
+      
+      p(style = "font-size:11px; margin-top:15px;",
+        a("🔗 Learn more about COM-B model", 
+          href = "https://thedecisionlab.com/reference-guide/organizational-behavior/the-com-b-model-for-behavior-change", 
+          target = "_blank")
+      )
+    )
+  )
+),
+      # Suggestions View
+      conditionalPanel("input.journey_tabs == 'suggestions'",
+        div(style = "padding: 8px;",
+          
+          # Key Insight Banner
+          div(class = "stats-card",
+            h3("💡 Key Insight"),
+            p(textOutput("key_insight_text"), style = "font-size:10px;")
+          ),
+          
+          # Current Journey Header
+          h3(textOutput("suggestions_title"), style = "color:#2c3e50;"),
+          p(em(textOutput("cross_cutting_text")), style = "color:#666;"),
+          
+          br(),
+          
+          # Structural Models
+          conditionalPanel(
+            condition = "output.has_models == true",
+            div(class = "insight-box",
+              h4("🏗️ Structural Reform Models"),
+              uiOutput("structural_models_ui")
+            )
+          ),
+          
+          br(),
+          
+          # Stakeholder-specific suggestions
+          h4("👥 Suggestions by Stakeholder"),
+          uiOutput("stakeholder_suggestions_ui"),
+          
+          # Demographic note
+          conditionalPanel(
+            condition = "output.has_demographics == true",
+            br(),
+            div(class = "insight-box",
+              h4("📊 Demographic Variations"),
+              textOutput("demographic_note")
+            )
+          )
+        )
+      ),
+      
+      # Bottom tabs
+      tabsetPanel(
+        tabPanel("🎯 ML Insights",
+          div(class = "stats-card",
+            h3(textOutput("insight_title")),
+            p("Strategic Analysis Based on Current View")
+          ),
+          div(class = "insight-box", style = "font-size:12px; max-height:300px; overflow-y:auto;",
+  verbatimTextOutput("ml_insights")
+)
+        ),
+        tabPanel("📊 Data Table", DTOutput("data_table", height = "200px")),
+        tabPanel("📖 Glossary", DTOutput("glossary_table", height = "200px"))
+      )
+    )
+  )
+)
+```
+
+###Server Function Definition
+```{r}
+# ============================================
+# SERVER
+# ============================================
+server <- function(input, output, session) {
+  
+  # Update filters based on tab selection
+  observeEvent(input$journey_tabs, {
+    if(input$journey_tabs != "All" && input$journey_tabs != "comb_info" && input$journey_tabs != "suggestions") {
+      updateSelectInput(session, "actor", selected = "All")
+    }
+  })
+  
+  # Reactive filtering
+  filtered_nodes <- reactive({
+    df <- nodes
+    
+    # Journey filtering - check exact values in data
+if(input$journey_tabs != "All" && input$journey_tabs != "comb_info" && input$journey_tabs != "suggestions") {
+  cat("\nFiltering journey:", input$journey_tabs, "\n")
+  cat("Unique journeys in data:", paste(unique(df$journey), collapse = ", "), "\n")
+  df <- df %>% filter(journey == input$journey_tabs)
+  cat("Rows after journey filter:", nrow(df), "\n")
+}
+    
+    if(!is.null(input$actor) && input$actor != "All") {
+      df <- df %>% filter(actor == input$actor)
+    }
+    
+    if(!is.null(input$effect_filter) && input$effect_filter != "All") {
+      df <- df %>% filter(effect_type == input$effect_filter)
+    }
+    
+    if(!is.null(input$search) && input$search != "") {
+      df <- df %>% filter(str_detect(tolower(name), tolower(input$search)))
+    }
+    
+    if(input$show_gaps && !is.null(nodes$is_gap)) {
+  df$color.border <- ifelse(df$is_gap, "#ff0000", "#333333")
+  df$borderWidth <- ifelse(df$is_gap, 4, 1)
+}
+    if(!is.null(input$l3_filter) && input$l3_filter != "All") {
+  df <- df %>% filter(l3_category == input$l3_filter)
+  }
+    
+    df
+  })
+  
+  filtered_edges <- reactive({
+    valid_ids <- filtered_nodes()$id
+    edges %>% filter(from %in% valid_ids & to %in% valid_ids)
+  })
+  
+  # Network visualization
+    # Network visualization
+  output$network <- renderVisNetwork({
+    req(nrow(filtered_nodes()) > 0)
+    vis_nodes <- filtered_nodes() %>% mutate(label = if(input$show_labels) name else "")
+    
+    visNetwork(vis_nodes, filtered_edges()) %>%
+      visEdges(
+        arrows = list(to = list(enabled = TRUE, scaleFactor = 0.6)),
+        smooth = list(enabled = TRUE, type = "continuous"),
+        color = list(inherit = TRUE),
+        length = 250
+      ) %>%
+      visNodes(
+        shadow = list(enabled = TRUE, size = 3), 
+        font = list(size = 11),
+        scaling = list(min = 15, max = 35)
+      ) %>%
+      visOptions(
+        highlightNearest = list(enabled = TRUE, degree = 2, hover = TRUE),
+        nodesIdSelection = TRUE
+      ) %>%
+      visInteraction(hover = TRUE, tooltipDelay = 0, navigationButtons = TRUE) %>%
+      visPhysics(
+        solver = "forceAtlas2Based",
+        stabilization = list(enabled = TRUE, iterations = 1000),
+        forceAtlas2Based = list(
+          gravitationalConstant = -50,
+          centralGravity = 0.01,
+          springLength = 200,
+          springConstant = 0.08
+        )
+      )
+  })
+  
+  # ============================================
+  # SUGGESTIONS SERVER LOGIC
+  # ============================================
+  
+  # Reactive suggestion data
+  current_suggestions <- reactive({
+    # Get the active journey from the main tabs, or default
+    active_journey <- input$journey_tabs
+    if(active_journey %in% names(suggestions_db)) {
+      suggestions_db[[active_journey]]
+    } else {
+      suggestions_db[["Receive Information"]]
+    }
+  })
+  
+  output$key_insight_text <- renderText({ key_insight })
+  
+  output$suggestions_title <- renderText({
+    req(current_suggestions())
+    current_suggestions()$title
+  })
+  
+  output$cross_cutting_text <- renderText({
+    req(current_suggestions())
+    current_suggestions()$cross_cutting
+  })
+  
+  output$has_models <- reactive({
+    req(current_suggestions())
+    !is.null(current_suggestions()$structural_models)
+  })
+  outputOptions(output, "has_models", suspendWhenHidden = FALSE)
+  
+  output$has_demographics <- reactive({
+    req(current_suggestions())
+    !is.null(current_suggestions()$demographic_note)
+  })
+  outputOptions(output, "has_demographics", suspendWhenHidden = FALSE)
+  
+  output$structural_models_ui <- renderUI({
+    req(current_suggestions())
+    models <- current_suggestions()$structural_models
+    
+    tagList(
+      lapply(models, function(m) {
+        p(m, style = "margin:5px 0;")
+      })
+    )
+  })
+  
+  output$demographic_note <- renderText({
+    req(current_suggestions())
+    current_suggestions()$demographic_note
+  })
+  
+  output$stakeholder_suggestions_ui <- renderUI({
+    req(current_suggestions())
+    stakeholders <- current_suggestions()$by_stakeholder
+    
+    panels <- lapply(names(stakeholders), function(stake_name) {
+      stake <- stakeholders[[stake_name]]
+      
+      div(class = "suggestion-card",
+        h5(paste(stake$icon, stake_name), style = "margin-top:0;"),
+        tags$ul(style = "margin-bottom:5px;",
+          lapply(stake$suggestions, function(s) {
+            tags$li(s, style = "font-size:0.9em; margin-bottom:3px;")
+          })
+        ),
+        if(!is.null(stake$emphasis)) {
+          div(class = "emphasis-box",
+            strong("🎯 Emphasis: "), stake$emphasis
+          )
+        }
+      )
+    })
+    
+    do.call(tagList, panels)
+  })
+  
+  # ============================================
+  # ML INSIGHTS (UPDATED WITH SUGGESTIONS)
+  # ============================================
+  
+  ml_results <- reactiveVal("Click 'Generate ML Insights' to analyze the network.\n\nNavigate to the 💡 Suggestions tab for stakeholder recommendations.")
+  
+  observeEvent(input$run_ml, {
+  current_journey <- input$journey_tabs
+  
+  # Get filtered data
+  f_nodes <- filtered_nodes()
+  f_edges <- filtered_edges()
+  
+  # Separate influences and behaviors
+  inf_nodes <- f_nodes %>% filter(type == "Influence")
+  beh_nodes <- f_nodes %>% filter(type == "Behavior")
+  
+  # Count effects
+  n_levers <- sum(inf_nodes$effect_type == "Lever (Positive)")
+  n_barriers <- sum(inf_nodes$effect_type == "Barrier (Negative)")
+  n_mixed <- sum(inf_nodes$effect_type == "Both/Mixed")
+  
+  # Top barriers (negative effect influences)
+  top_barriers <- inf_nodes %>%
+    filter(effect_type == "Barrier (Negative)") %>%
+    arrange(desc(mentions)) %>%
+    head(5) %>%
+    pull(name)
+  
+  # Top levers (positive effect influences)
+  top_levers <- inf_nodes %>%
+    filter(effect_type == "Lever (Positive)") %>%
+    arrange(desc(mentions)) %>%
+    head(5) %>%
+    pull(name)
+  
+  # Most connected nodes (centrality)
+  edge_counts <- c(table(f_edges$from), table(f_edges$to))
+  if(length(edge_counts) > 0) {
+    node_connections <- data.frame(
+      id = as.numeric(names(edge_counts)),
+      connections = as.numeric(edge_counts)
+    ) %>%
+      group_by(id) %>%
+      summarise(connections = sum(connections), .groups = "drop")
+    
+    central_nodes <- f_nodes %>%
+      left_join(node_connections, by = "id") %>%
+      mutate(connections = ifelse(is.na(connections), 0, connections)) %>%
+      filter(type == "Influence") %>%
+      arrange(desc(connections)) %>%
+      head(5)
+  } else {
+    central_nodes <- data.frame(name = "N/A", connections = 0)
+  }
+  
+  # Gaps
+  gap_count <- sum(f_nodes$is_gap, na.rm = TRUE)
+  gap_names <- f_nodes %>%
+    filter(is_gap) %>%
+    arrange(desc(mentions)) %>%
+    head(5) %>%
+    pull(name)
+  
+  # Build insights
+  insights <- paste0(
+    "╔══════════════════════════════════════╗\n",
+    "║   📊 STRATEGIC ANALYSIS              ║\n",
+    "║   Stakeholder: ", sprintf("%-22s", input$stakeholder), "║\n",
+    "╚══════════════════════════════════════╝\n\n",
+    
+    "📈 NETWORK OVERVIEW\n",
+    "─────────────────────────────────────────\n",
+    "   • Total Nodes: ", nrow(f_nodes), 
+    " (", nrow(inf_nodes), " influences, ", nrow(beh_nodes), " behaviors)\n",
+    "   • Connections: ", nrow(f_edges), "\n",
+    "   • Density: ", ifelse(nrow(f_nodes) > 1, 
+        round(nrow(f_edges) / (nrow(f_nodes) * (nrow(f_nodes) - 1)), 3), 0), "\n\n",
+    
+    "🔴 TOP BARRIERS (What Blocks Action)\n",
+    "─────────────────────────────────────────\n",
+    if(length(top_barriers) > 0) {
+      paste0("   ", 1:length(top_barriers), ". ", top_barriers, 
+             " (Mentions: ", inf_nodes$mentions[match(top_barriers, inf_nodes$name)], ")\n", collapse = "")
+    } else {
+      "   No strong barriers identified in current view.\n"
+    }, "\n",
+    
+    "🟢 TOP LEVERS (What Enables Action)\n",
+    "─────────────────────────────────────────\n",
+    if(length(top_levers) > 0) {
+      paste0("   ", 1:length(top_levers), ". ", top_levers,
+             " (Mentions: ", inf_nodes$mentions[match(top_levers, inf_nodes$name)], ")\n", collapse = "")
+    } else {
+      "   No strong levers identified in current view.\n"
+    }, "\n",
+    
+    "🎯 CENTRAL NODES (Most Connected)\n",
+    "─────────────────────────────────────────\n",
+    if(nrow(central_nodes) > 0) {
+      paste0("   ", 1:nrow(central_nodes), ". ", central_nodes$name,
+             " (", central_nodes$connections, " connections)\n", collapse = "")
+    } else {
+      "   No connections in current view.\n"
+    }, "\n",
+    
+    "🔴 GAPS (High Potential, Low Connections)\n",
+    "─────────────────────────────────────────\n",
+    if(gap_count > 0) {
+      paste0("   Found: ", gap_count, " gaps\n",
+             paste0("   • ", head(gap_names, 5), "\n", collapse = ""))
+    } else {
+      "   No gaps identified. Enable 'Highlight Gaps' to detect.\n"
+    }
+  )
+  
+  # Add stakeholder-specific suggestions
+  suggestions_text <- ""
+  if(current_journey %in% names(suggestions_db)) {
+    journey_sug <- suggestions_db[[current_journey]]
+    stake_key <- input$stakeholder
+    
+    stake_mapping <- c(
+      "CSO" = "CSO",
+      "Policy Maker" = "Policy maker",
+      "Media" = "Media professional",
+      "Local Leader" = "Local Govt official"
+    )
+    
+    mapped_key <- stake_mapping[stake_key]
+    if(is.null(mapped_key)) mapped_key <- "Citizen"
+    
+    stake_sug <- journey_sug$by_stakeholder[[mapped_key]]
+    
+    if(!is.null(stake_sug)) {
+      suggestions_text <- paste0(
+        "\n\n💡 RECOMMENDATIONS FOR ", toupper(stake_key), "\n",
+        "─────────────────────────────────────────\n",
+        "Based on stakeholder data for '", current_journey, "':\n\n",
+        paste0("   ✅ ", stake_sug$suggestions, collapse = "\n"),
+        if(!is.null(stake_sug$emphasis)) {
+          paste0("\n\n   🎯 PRIORITY: ", stake_sug$emphasis)
+        } else ""
+      )
+    }
+  }
+  
+  ml_results(paste0(insights, suggestions_text))
+})
+  
+  output$ml_insights <- renderText({ ml_results() })
+  output$insight_title <- renderText({ paste(input$stakeholder, "Strategic Analysis") })
+  
+  # Data table
+  output$data_table <- renderDT({
+    datatable(
+      filtered_nodes() %>% filter(type == "Influence") %>%
+        select(Name = name, Actor = actor, Journey = journey, Mentions = mentions, Effect = effect_type),
+      options = list(pageLength = 10, dom = 'Bt'), rownames = FALSE
+    ) %>% formatStyle('Effect', backgroundColor = styleEqual(
+      c("Lever (Positive)","Barrier (Negative)","Both/Mixed"),
+      c("#d4edda","#f8d7da","#fff3cd")))
+  })
+  
+  # Glossary table
+  output$glossary_table <- renderDT({
+    datatable(
+      glossary_clean %>% select(Term = name, Definition = definition, Level = level),
+      options = list(pageLength = 15, dom = 'Bt'), rownames = FALSE
+    ) %>% formatStyle('Level', backgroundColor = styleEqual(
+      c("L4 System Level"), c("#fdebd0"))) %>%
+      formatStyle('Term', fontWeight = styleEqual(
+        glossary_clean$name[glossary_clean$is_l4], rep("bold", sum(glossary_clean$is_l4))))
+  })
+  
+  # Download handler
+  output$download_data <- downloadHandler(
+    filename = function() paste0("behavioral_data_", Sys.Date(), ".csv"),
+    content = function(file) write.csv(filtered_nodes(), file, row.names = FALSE)
+  )
+}
+```
+
+###Running Application
+```{r}
+# Run the application
+shinyApp(ui = ui, server = server)
+```
+
