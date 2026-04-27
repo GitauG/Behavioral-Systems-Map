@@ -1535,16 +1535,10 @@
       "checksum": "3d261244a19d5db6815740d2fc18807d"
     },
     ".Rprofile": {
-      "checksum": "620b88be7899c9e22ed0ddbbd8d62b6a"
+      "checksum": "bf5828c1201e623bd83e3e76374f594f"
     },
-    "behavior_network - Sheet 1.csv": {
+    "behavior_network.csv": {
       "checksum": "704bccb6f83b157bd4d7de574f439f05"
-    },
-    "Copy of Mapping Matrix - Glossary (constructs).csv": {
-      "checksum": "5fb33289bd137eb3010f65fd78ba4cd5"
-    },
-    "Copy of Mapping Matrix - Mapping Matrix.csv": {
-      "checksum": "d6b1bc7e7a60fdead169f6fd3ca75735"
     },
     "data_quality_check_2026-04-23.xlsx": {
       "checksum": "d7f8df8599073234b8f36fb7af17f3ba"
@@ -1553,10 +1547,31 @@
       "checksum": "261c2f1a964f8807022b121153e168d0"
     },
     "data_quality_check_2026-04-27.xlsx": {
-      "checksum": "e790b3c1d83223e30cb1ae247e9e5fed"
+      "checksum": "51ee83e693ede6f059f2be277e99adc1"
+    },
+    "data/behavior_network.rds": {
+      "checksum": "189fa99d0a6fe6d1db39f2fadd3eb9b4"
+    },
+    "data/glossary.rds": {
+      "checksum": "aa8c17d32c8731ae46a158f6f9c345f6"
+    },
+    "data/main_matrix.rds": {
+      "checksum": "a6dfbce349aaf29e101fca27e60b8b47"
+    },
+    "glossary.csv": {
+      "checksum": "5fb33289bd137eb3010f65fd78ba4cd5"
+    },
+    "main_matrix.csv": {
+      "checksum": "d6b1bc7e7a60fdead169f6fd3ca75735"
     },
     "Map (V2).Rmd": {
+      "checksum": "71c37d5959c0ce8ea3379ffccb12401c"
+    },
+    "Map (V2).Rmd.backup": {
       "checksum": "d58166d45dbbf7a70013bd78f60f908f"
+    },
+    "Map--V2-.html": {
+      "checksum": "34c2d7a9c1463c5a95e0600cc13a60b1"
     },
     "renv.lock": {
       "checksum": "dbeae6cab9efdbf068bc57160b3e57c7"
